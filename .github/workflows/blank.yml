@@ -7,15 +7,15 @@ on:
       rom_name:
         description: 'ROM Name (e.g., LineageOS)'
         required: true
-        default: 'lineage'
+        default: 'rise'
       rom_manifest:
         description: 'ROM Manifest URL'
         required: true
-        default: 'https://github.com/LineageOS/android.git'
+        default: 'https://github.com/RisingOS-Revived/android.git'
       rom_branch:
         description: 'Manifest Branch'
         required: true
-        default: 'lineage-20.0'
+        default: 'qpr2'
 
       # ─── Device ──────────────────────────────────────────────────
       device_codename:
@@ -25,7 +25,7 @@ on:
       lunch_combo:
         description: 'Lunch combo (e.g., lineage_daisy-userdebug)'
         required: true
-        default: 'lineage_daisy-userdebug'
+        default: 'riseup daisy user || rise b'
 
       # ─── Device-tree clone (classic style) ───────────────────────
       device_tree_url:
@@ -146,8 +146,8 @@ jobs:
       run: |
         cd rom
         source build/envsetup.sh
-        lunch "${{ github.event.inputs.lunch_combo }}"
-        mka bacon -j$(nproc) 2>&1 | tee build.log
+        lunch "${{ github.event.inputs.lunch_combo }}" | riseup daisy user 
+        mka bacon -j$(nproc) 2>&1 | rise b | tee build.log
 
     #─────────────────────────────────────────────────────────────────
     #   7)  Post-build housekeeping
