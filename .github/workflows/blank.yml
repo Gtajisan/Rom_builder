@@ -1,0 +1,111 @@
+name: Fuking ROM Builder 
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_name:
+        description: 'ROM Name (e.g., LineageOS)'
+        required: true
+        default: 'lineage'
+      rom_manifest:
+        description: 'ROM Manifest URL'
+        required: true
+        default: 'https://github.com/LineageOS/android.git'
+      rom_branch:
+        description: 'Manifest Branch'
+        required: true
+        default: 'lineage-20.0'
+      device_codename:
+        description: 'Device Codename (e.g., daisy)'
+        required: true
+        default: 'daisy'
+      lunch_combo:
+        description: 'Lunch Combo (e.g., lineage_daisy-userdebug)'
+        required: true
+        default: 'lineage_daisy-userdebug'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2880
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-11-jdk git wget curl bc bison flex build-essential \
+          zip unzip python3 python-is-python3 ccache libncurses5-dev libssl-dev \
+          repo libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zlib1g-dev
+
+    - name: Setup Repo
+      run: |
+        mkdir rom && cd rom
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        repo init -u ${{ github.event.inputs.rom_manifest }} -b ${{ github.event.inputs.rom_branch }} --depth=1
+        repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j$(nproc)
+
+    - name: Clone Device Trees
+      run: |
+        cd rom
+        mkdir -p .repo/local_manifests
+        echo '<manifest></manifest>' > .repo/local_manifests/device.xml
+        repo sync -j$(nproc)
+
+    - name: Set up CCache
+      run: |
+        cd rom
+        export USE_CCACHE=1
+        ccache -M 20G
+        ccache -o compression=true
+        ccache -z
+
+    - name: Start ROM Build
+      run: |
+        cd rom
+        source build/envsetup.sh
+        lunch ${{ github.event.inputs.lunch_combo }}
+        mka bacon -j$(nproc) | tee build.log
+
+    - name: Show CCache Stats
+      run: |
+        cd rom
+        ccache -s
+
+    - name: Find ROM Zip Name
+      id: get_rom
+      run: |
+        cd rom/out/target/product/${{ github.event.inputs.device_codename }}
+        export ZIP_NAME=$(ls *.zip | grep -v "ota" | head -n 1)
+        echo "ROM_ZIP=$ZIP_NAME" >> $GITHUB_ENV
+        echo "ROM_ZIP=$ZIP_NAME" >> $GITHUB_OUTPUT
+        echo "Detected ROM: $ZIP_NAME"
+
+    - name: Show ROM Size
+      run: |
+        cd rom/out/target/product/${{ github.event.inputs.device_codename }}
+        ls -lh $ROM_ZIP
+
+    - name: Upload ROM Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ROM_ZIP }}
+        path: rom/out/target/product/${{ github.event.inputs.device_codename }}/${{ env.ROM_ZIP }}
+
+    - name: Upload Build Log
+      uses: actions/upload-artifact@v4
+      with:
+        name: build.log
+        path: rom/build.log
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: rom-${{ github.event.inputs.device_codename }}-${{ github.run_number }}
+        name: ROM Build - ${{ github.event.inputs.device_codename }}
+        files: rom/out/target/product/${{ github.event.inputs.device_codename }}/${{ env.ROM_ZIP }}
+        draft: false
+        prerelease: false
