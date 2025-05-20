@@ -1,180 +1,217 @@
-name: 🎉 Fucking Custom ROM Builder 🚀
+name: Fuking ROM Builder
 
 on:
   workflow_dispatch:
     inputs:
+      # ─── Build Basics ─────────────────────────────────────────────
+      rom_name:
+        description: 'ROM Name (e.g., LineageOS)'
+        required: true
+        default: 'lineage'
       rom_manifest:
-        description: 'ROM Manifest Git URL'
+        description: 'ROM Manifest URL'
         required: true
         default: 'https://github.com/LineageOS/android.git'
       rom_branch:
-        description: 'ROM Branch'
+        description: 'Manifest Branch'
         required: true
-        default: 'lineage-21.0'
-      device_manifest:
-        description: 'Device trees manifest Git URL (optional)'
-        required: false
-        default: ''
-      device_branch:
-        description: 'Device trees branch (optional)'
-        required: false
-        default: 'main'
-      device_codename:
-        description: 'Device codename'
+        default: 'lineage-20.0'
+
+      # ─── Device ──────────────────────────────────────────────────
+      device_codenames:
+        description: 'Device codename(s), comma separated (e.g., daisy,snow)'
         required: true
         default: 'daisy'
-      lunch_target:
-        description: 'Lunch target (leave empty for default)'
+      lunch_combo:
+        description: 'Lunch combo (e.g., lineage_daisy-userdebug)'
+        required: true
+        default: 'lineage_daisy-userdebug'
+
+      # ─── Device-tree clone (classic style) ───────────────────────
+      device_tree_urls:
+        description: 'Device tree repo URLs (comma separated, blank to skip)'
         required: false
         default: ''
-      build_variant:
-        description: 'Build variant (user/userdebug/eng)'
+      device_tree_branches:
+        description: 'Device-tree branches (comma separated, empty = default)'
         required: false
-        default: 'userdebug'
+        default: ''
+      device_tree_paths:
+        description: 'Relative destinations (comma separated; empty=default device/<codename>)'
+        required: false
+        default: ''
+
+      # ─── OPTIONAL Local manifest (modern “roomservice”) ──────────
+      local_manifest_url:
+        description: 'URL of local_manifest repo or raw XML (leave blank to skip)'
+        required: false
+      local_manifest_branch:
+        description: 'Branch for local_manifest repo'
+        required: false
+        default: ''
+
+      # ─── Build concurrency option ──────────────────────────────────
+      build_jobs:
+        description: 'Number of parallel jobs for build'
+        required: false
+        default: '$(nproc)'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2880
 
     env:
-      CCACHE_DIR: "/mnt/ccache"
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      SOURCEFORGE_USER: ${{ secrets.SOURCEFORGE_USER }}
-      SOURCEFORGE_PASS: ${{ secrets.SOURCEFORGE_PASS }}
-      GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
-      GDRIVE_TOKEN: ${{ secrets.GDRIVE_TOKEN }}
+      ROM_DIR: ${{ github.workspace }}/rom
 
     steps:
-    - name: 🔥 Start Build - Banner
-      run: |
-        echo -e "\e[1;96m==========================================\e[0m"
-        echo -e "\e[1;92m🚀 Starting Custom ROM Build for ${{ github.event.inputs.device_codename }} 🚀\e[0m"
-        echo -e "\e[1;96m==========================================\e[0m"
+      #───────────────────────────────────────────────────────────────
+      - name: Checkout workflow repo (for helper scripts or configs)
+        uses: actions/checkout@v4
 
-    - name: 📥 Checkout repo
-      uses: actions/checkout@v4
+      #───────────────────────────────────────────────────────────────
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openjdk-11-jdk git wget curl bc bison flex build-essential \
+            zip unzip python3 python-is-python3 python3-pip \
+            ccache libncurses5-dev libncurses5 libncursesw5-dev \
+            libssl-dev libxml2-utils liblz4-tool lzop zlib1g-dev \
+            pkg-config rsync schedtool xsltproc pngcrush \
+            jq nano tmux tree
+          # Raise open file limits for repo sync
+          echo -e '* soft nofile 65535\n* hard nofile 65535' | sudo tee -a /etc/security/limits.conf
 
-    - name: ⚙️ Install dependencies
-      run: |
-        echo -e "\e[1;93m⏳ Installing dependencies...\e[0m"
-        sudo apt update
-        sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-          gcc-multilib g++-multilib libc6-dev-i386 libncurses5 libncurses5-dev \
-          x11proto-core-dev libx11-dev lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc \
-          unzip fontconfig openjdk-17-jdk python-is-python3 python3 python3-pip ccache repo
+      #───────────────────────────────────────────────────────────────
+      - name: Configure Git user
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
 
-    - name: 🗂 Setup ccache
-      run: |
-        echo -e "\e[1;94m⚡ Setting up ccache...\e[0m"
-        mkdir -p $CCACHE_DIR
-        export USE_CCACHE=1
-        export CCACHE_EXEC=$(which ccache)
-        ccache -M 50G
-        echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
-        echo "USE_CCACHE=1" >> $GITHUB_ENV
+      #───────────────────────────────────────────────────────────────
+      - name: Setup repo tool
+        run: |
+          if ! command -v repo &>/dev/null; then
+            sudo curl -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+            sudo chmod +x /usr/local/bin/repo
+          fi
 
-    - name: 📦 Initialize ROM repo
-      run: |
-        mkdir -p ~/rom && cd ~/rom
-        echo -e "\e[1;95m📡 Initializing ROM manifest\e[0m"
-        echo -e "\e[1;95m🔗 URL: ${{ github.event.inputs.rom_manifest }} Branch: ${{ github.event.inputs.rom_branch }}\e[0m"
-        repo init -u "${{ github.event.inputs.rom_manifest }}" -b "${{ github.event.inputs.rom_branch }}" --depth=1 || exit 1
+      #───────────────────────────────────────────────────────────────
+      - name: Init & sync ROM manifest
+        run: |
+          mkdir -p $ROM_DIR
+          cd $ROM_DIR
+          repo init -u "${{ github.event.inputs.rom_manifest }}" \
+                    -b "${{ github.event.inputs.rom_branch }}" --depth=1
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
 
-    - name: 🔄 Sync ROM source
-      run: |
-        cd ~/rom
-        echo -e "\e[1;95m🔄 Syncing ROM source...\e[0m"
-        repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j$(nproc) || exit 1
+      #───────────────────────────────────────────────────────────────
+      - name: Inject local manifest (if provided)
+        if: ${{ github.event.inputs.local_manifest_url != '' }}
+        run: |
+          cd $ROM_DIR
+          mkdir -p .repo/local_manifests
+          rm -rf .repo/local_manifests/*
+          if [[ "${{ github.event.inputs.local_manifest_url }}" =~ \.xml$ ]]; then
+            curl -L -o .repo/local_manifests/local.xml "${{ github.event.inputs.local_manifest_url }}"
+          else
+            git clone --depth 1 -b "${{ github.event.inputs.local_manifest_branch }}" \
+              "${{ github.event.inputs.local_manifest_url }}" .repo/local_manifests
+          fi
+          echo "::notice ::Local manifest injected"
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
 
-    - name: 🌲 Clone device trees (optional)
-      if: ${{ github.event.inputs.device_manifest != '' }}
-      run: |
-        cd ~/rom
-        echo -e "\e[1;96m🌳 Cloning device/vendor/kernel trees from device manifest\e[0m"
-        echo -e "\e[1;96m🌐 URL: ${{ github.event.inputs.device_manifest }} Branch: ${{ github.event.inputs.device_branch }}\e[0m"
-        rm -rf device/xiaomi/${{ github.event.inputs.device_codename }} vendor/xiaomi/${{ github.event.inputs.device_codename }} kernel/xiaomi/${{ github.event.inputs.device_codename }}
-        git clone --depth=1 -b "${{ github.event.inputs.device_branch }}" "${{ github.event.inputs.device_manifest }}/device/xiaomi/${{ github.event.inputs.device_codename }}.git" device/xiaomi/${{ github.event.inputs.device_codename }}
-        git clone --depth=1 -b "${{ github.event.inputs.device_branch }}" "${{ github.event.inputs.device_manifest }}/vendor/xiaomi/${{ github.event.inputs.device_codename }}.git" vendor/xiaomi/${{ github.event.inputs.device_codename }}
-        git clone --depth=1 -b "${{ github.event.inputs.device_branch }}" "${{ github.event.inputs.device_manifest }}/kernel/xiaomi/${{ github.event.inputs.device_codename }}.git" kernel/xiaomi/${{ github.event.inputs.device_codename }}
+      #───────────────────────────────────────────────────────────────
+      - name: Clone standalone device trees (optional)
+        if: ${{ github.event.inputs.device_tree_urls != '' }}
+        run: |
+          cd $ROM_DIR
+          IFS=',' read -ra URLS <<< "${{ github.event.inputs.device_tree_urls }}"
+          IFS=',' read -ra BRANCHES <<< "${{ github.event.inputs.device_tree_branches }}"
+          IFS=',' read -ra PATHS <<< "${{ github.event.inputs.device_tree_paths }}"
+          for i in "${!URLS[@]}"; do
+            url="${URLS[$i]}"
+            branch="${BRANCHES[$i]:-main}"
+            path="${PATHS[$i]}"
+            # fallback path if empty
+            if [[ -z "$path" ]]; then
+              # try to extract codename from url or fallback to device/<codename>
+              codename="${{ github.event.inputs.device_codenames }}"
+              if [[ "$codename" == *","* ]]; then
+                codename=$(echo $codename | cut -d',' -f1)
+              fi
+              path="device/$codename"
+            fi
+            echo "Cloning device tree $url (branch $branch) into $path"
+            rm -rf "$path"
+            git clone --depth 1 -b "$branch" "$url" "$path"
+          done
 
-    - name: ⚙️ Setup build environment & lunch
-      run: |
-        cd ~/rom
-        source build/envsetup.sh
-        LUNCH_TARGET="${{ github.event.inputs.lunch_target }}"
-        if [ -z "$LUNCH_TARGET" ]; then
-          LUNCH_TARGET="lineage_${{ github.event.inputs.device_codename }}-${{ github.event.inputs.build_variant }}"
-        fi
-        echo -e "\e[1;92m🍱 Lunch target: $LUNCH_TARGET\e[0m"
-        lunch $LUNCH_TARGET
+      #───────────────────────────────────────────────────────────────
+      - name: Setup CCache
+        run: |
+          cd $ROM_DIR
+          export USE_CCACHE=1
+          ccache -M 25G
+          ccache -o compression=true
+          ccache -z
 
-    - name: 🛠 Start build
-      run: |
-        cd ~/rom
-        echo -e "\e[1;93m⚙️ Building ROM (make bacon)...\e[0m"
-        make bacon -j$(nproc)
+      #───────────────────────────────────────────────────────────────
+      - name: Setup build environment and lunch
+        run: |
+          cd $ROM_DIR
+          source build/envsetup.sh
+          lunch "${{ github.event.inputs.lunch_combo }}"
 
-    - name: 📤 Upload build artifact to GitHub
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-${{ github.event.inputs.device_codename }}
-        path: ~/rom/out/target/product/${{ github.event.inputs.device_codename }}/*.zip
+      #───────────────────────────────────────────────────────────────
+      - name: Build ROM
+        run: |
+          cd $ROM_DIR
+          mka bacon -j${{ github.event.inputs.build_jobs }} 2>&1 | tee build.log
 
-    - name: 🌐 Upload to SourceForge
-      if: success() && env.SOURCEFORGE_USER != '' && env.SOURCEFORGE_PASS != ''
-      run: |
-        echo -e "\e[1;94m⬆️ Uploading ROM to SourceForge...\e[0m"
-        sudo apt install -y lftp
-        FILE=$(ls ~/rom/out/target/product/${{ github.event.inputs.device_codename }}/*.zip | head -n 1)
-        lftp -u $SOURCEFORGE_USER,$SOURCEFORGE_PASS -e "set ssl:verify-certificate no; cd /home/project-web/yourproject/roms/${{ github.event.inputs.device_codename }}; put $FILE; bye"
+      #───────────────────────────────────────────────────────────────
+      - name: Show CCache stats
+        run: |
+          cd $ROM_DIR
+          ccache -s
 
-    - name: ☁️ Upload to Google Drive via rclone
-      if: success() && env.GDRIVE_REMOTE != '' && env.GDRIVE_TOKEN != ''
-      env:
-        RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_TOKEN }}
-      run: |
-        echo -e "\e[1;94m⬆️ Uploading ROM to Google Drive...\e[0m"
-        curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-        unzip rclone-current-linux-amd64.zip
-        sudo cp rclone-*-linux-amd64/rclone /usr/bin/
-        sudo chown root:root /usr/bin/rclone
-        sudo chmod 755 /usr/bin/rclone
-        mkdir -p ~/.config/rclone
-        echo "[${GDRIVE_REMOTE}]" > ~/.config/rclone/rclone.conf
-        echo "type = drive" >> ~/.config/rclone/rclone.conf
-        echo "token = $RCLONE_CONFIG_GDRIVE_TOKEN" >> ~/.config/rclone/rclone.conf
-        FILE=$(ls ~/rom/out/target/product/${{ github.event.inputs.device_codename }}/*.zip | head -n 1)
-        rclone copy $FILE ${GDRIVE_REMOTE}:/$DEVICE_CODENAME/ -v
+      #───────────────────────────────────────────────────────────────
+      - name: Locate ROM zip
+        id: zippy
+        run: |
+          cd $ROM_DIR/out/target/product/${{ github.event.inputs.device_codenames%%,* }}
+          ZIP=$(ls *.zip | grep -vE 'ota|incremental' | head -n1 || true)
+          if [[ -z "$ZIP" ]]; then
+            echo "::error ::No ROM zip found!"
+            exit 1
+          fi
+          echo "ZIP=$ZIP" | tee -a $GITHUB_ENV
+          echo "ROM_ZIP=$ZIP" | tee -a $GITHUB_OUTPUT
+          echo "Found ROM zip: $ZIP"
 
-    - name: 📲 Telegram notify on success
-      if: success() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
-      run: |
-        curl -s -X POST https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage \
-          -d chat_id=${TELEGRAM_CHAT_ID} \
-          -d text="✅ *Custom ROM* build for *${{ github.event.inputs.device_codename }}* completed successfully! 🎉" \
-          -d parse_mode=Markdown
+      #───────────────────────────────────────────────────────────────
+      - name: List size
+        run: |
+          cd $ROM_DIR/out/target/product/${{ github.event.inputs.device_codenames%%,* }}
+          ls -lh "$ZIP"
 
-    - name: ❌ Telegram notify on failure
-      if: failure() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
-      run: |
-        curl -s -X POST https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage \
-          -d chat_id=${TELEGRAM_CHAT_ID} \
-          -d text="❌ *Custom ROM* build for *${{ github.event.inputs.device_codename }}* failed. Please check logs. ⚠️" \
-          -d parse_mode=Markdown
+      #───────────────────────────────────────────────────────────────
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zippy.outputs.ROM_ZIP }}
+          path: ${{ env.ROM_DIR }}/out/target/product/${{ github.event.inputs.device_codenames%%,* }}/${{ steps.zippy.outputs.ROM_ZIP }}
 
-    - name: 🎉 Build complete banner
-      if: success()
-      run: |
-        echo -e "\e[1;92m==========================================\e[0m"
-        echo -e "\e[1;92m✅ Build completed successfully! ✅\e[0m"
-        echo -e "\e[1;92m==========================================\e[0m"
+      #───────────────────────────────────────────────────────────────
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build.log
+          path: ${{ env.ROM_DIR }}/build.log
 
-    - name: ⚠️ Build failed banner
-      if: failure()
-      run: |
-        echo -e "\e[1;91m==========================================\e[0m"
-        echo -e "\e[1;91m❌ Build failed! Please review the logs ❌\e[0m"
-        echo -e "\e[1;91m==========================================\e[0m"
+      #───────────────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rom-${{ github.event.inputs.device_codenames%%,* }}-${{ github.run_number }}
+          name: ${{ github.event.inputs.rom_name }}-${{ github.event.inputs.device_codenames%%,* }}-${{ github.run_number }}
+          files: ${{ env.ROM_DIR }}/out/target/product/${{ github.event.inputs.device_codenames%%,* }}/${{ steps.zippy.outputs.ROM_ZIP }}
