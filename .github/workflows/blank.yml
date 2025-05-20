@@ -1,8 +1,9 @@
-name: Fuking ROM Builder 
+name: Fuking ROM Builder
 
 on:
   workflow_dispatch:
     inputs:
+      # ─── Build Basics ─────────────────────────────────────────────
       rom_name:
         description: 'ROM Name (e.g., LineageOS)'
         required: true
@@ -15,14 +16,38 @@ on:
         description: 'Manifest Branch'
         required: true
         default: 'lineage-20.0'
+
+      # ─── Device ──────────────────────────────────────────────────
       device_codename:
-        description: 'Device Codename (e.g., daisy)'
+        description: 'Device codename (e.g., daisy)'
         required: true
         default: 'daisy'
       lunch_combo:
-        description: 'Lunch Combo (e.g., lineage_daisy-userdebug)'
+        description: 'Lunch combo (e.g., lineage_daisy-userdebug)'
         required: true
         default: 'lineage_daisy-userdebug'
+
+      # ─── Device-tree clone (classic style) ───────────────────────
+      device_tree_url:
+        description: 'Device tree repo (leave blank to skip)'
+        required: false
+      device_tree_branch:
+        description: 'Device-tree branch (ignored if url empty)'
+        required: false
+        default: ''
+      device_tree_path:
+        description: 'Relative destination (device/<oem>/<codename>)'
+        required: false
+        default: ''
+
+      # ─── OPTIONAL Local manifest (modern “roomservice”) ──────────
+      local_manifest_url:
+        description: 'URL of local_manifest repo or raw XML (leave blank to skip)'
+        required: false
+      local_manifest_branch:
+        description: 'Branch for local_manifest repo'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -30,73 +55,131 @@ jobs:
     timeout-minutes: 2880
 
     steps:
-    - name: Checkout
+    #─────────────────────────────────────────────────────────────────
+    - name: Checkout workflow repo (for any helper scripts you keep here)
       uses: actions/checkout@v4
 
-    - name: Setup Environment
+    #─────────────────────────────────────────────────────────────────
+    #   1)  Build environment (extra packages & ulimits)
+    #─────────────────────────────────────────────────────────────────
+    - name: Install build prerequisites
       run: |
         sudo apt-get update
-        sudo apt-get install -y openjdk-11-jdk git wget curl bc bison flex build-essential \
-          zip unzip python3 python-is-python3 ccache libncurses5-dev libssl-dev \
-          repo libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zlib1g-dev
+        sudo apt-get install -y \
+          openjdk-11-jdk git wget curl bc bison flex build-essential \
+          zip unzip python3 python-is-python3 python3-pip \
+          ccache libncurses5-dev libncurses5 libncursesw5-dev \
+          libssl-dev libxml2-utils liblz4-tool lzop zlib1g-dev \
+          pkg-config rsync schedtool xsltproc pngcrush \
+          jq nano tmux tree
 
-    - name: Setup Repo
+        # raise open-file limit so repo sync can't die
+        echo -e '* soft nofile 65535\n* hard nofile 65535' | sudo tee -a /etc/security/limits.conf
+
+    #─────────────────────────────────────────────────────────────────
+    #   2)  Initialize ROM repo & sync
+    #─────────────────────────────────────────────────────────────────
+    - name: Init & sync ROM manifest
       run: |
         mkdir rom && cd rom
-        git config --global user.name "GitHub Actions"
+        git config --global user.name  "GitHub Actions"
         git config --global user.email "actions@github.com"
-        repo init -u ${{ github.event.inputs.rom_manifest }} -b ${{ github.event.inputs.rom_branch }} --depth=1
-        repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j$(nproc)
 
-    - name: Clone Device Trees
+        # repo command (install if not present)
+        if ! command -v repo &>/dev/null; then
+          sudo curl -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          sudo chmod +x /usr/local/bin/repo
+        fi
+
+        repo init -u "${{ github.event.inputs.rom_manifest }}" \
+                  -b "${{ github.event.inputs.rom_branch }}" --depth=1
+        repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
+
+    #─────────────────────────────────────────────────────────────────
+    #   3)  (Optional) Local-manifest sync
+    #─────────────────────────────────────────────────────────────────
+    - name: Inject local manifest (if provided)
+      if: ${{ inputs.local_manifest_url != '' }}
       run: |
         cd rom
         mkdir -p .repo/local_manifests
-        echo '<manifest></manifest>' > .repo/local_manifests/device.xml
-        repo sync -j$(nproc)
+        rm -rf .repo/local_manifests/*
 
+        if [[ "${{ inputs.local_manifest_url }}" =~ \.xml$ ]]; then
+          curl -L -o .repo/local_manifests/local.xml "${{ inputs.local_manifest_url }}"
+        else
+          git clone --depth 1 \
+            -b "${{ inputs.local_manifest_branch }}" \
+            "${{ inputs.local_manifest_url }}" .repo/local_manifests
+        fi
+        echo "::notice ::local_manifest injected"
+        repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
+
+    #─────────────────────────────────────────────────────────────────
+    #   4)  (Optional) Direct device-tree clone
+    #─────────────────────────────────────────────────────────────────
+    - name: Clone standalone device tree
+      if: ${{ inputs.device_tree_url != '' }}
+      run: |
+        cd rom
+        dest="${{ inputs.device_tree_path }}"
+        [[ -z "$dest" ]] && dest="device/${{ inputs.device_codename }}"
+        rm -rf "$dest"
+        git clone --depth 1 -b "${{ inputs.device_tree_branch }}" \
+          "${{ inputs.device_tree_url }}" "$dest"
+
+    #─────────────────────────────────────────────────────────────────
+    #   5)  Configure & warm-up ccache
+    #─────────────────────────────────────────────────────────────────
     - name: Set up CCache
       run: |
         cd rom
         export USE_CCACHE=1
-        ccache -M 20G
+        ccache -M 25G
         ccache -o compression=true
         ccache -z
 
-    - name: Start ROM Build
+    #─────────────────────────────────────────────────────────────────
+    #   6)  Build
+    #─────────────────────────────────────────────────────────────────
+    - name: Build ROM
       run: |
         cd rom
         source build/envsetup.sh
-        lunch ${{ github.event.inputs.lunch_combo }}
-        mka bacon -j$(nproc) | tee build.log
+        lunch "${{ github.event.inputs.lunch_combo }}"
+        mka bacon -j$(nproc) 2>&1 | tee build.log
 
-    - name: Show CCache Stats
+    #─────────────────────────────────────────────────────────────────
+    #   7)  Post-build housekeeping
+    #─────────────────────────────────────────────────────────────────
+    - name: Show CCache stats
       run: |
         cd rom
         ccache -s
 
-    - name: Find ROM Zip Name
-      id: get_rom
+    - name: Locate ROM zip
+      id: zippy
       run: |
-        cd rom/out/target/product/${{ github.event.inputs.device_codename }}
-        export ZIP_NAME=$(ls *.zip | grep -v "ota" | head -n 1)
-        echo "ROM_ZIP=$ZIP_NAME" >> $GITHUB_ENV
-        echo "ROM_ZIP=$ZIP_NAME" >> $GITHUB_OUTPUT
-        echo "Detected ROM: $ZIP_NAME"
+        cd rom/out/target/product/${{ inputs.device_codename }}
+        ZIP=$(ls *.zip | grep -vE 'ota|incremental' | head -n1)
+        echo "ZIP=$ZIP"           | tee -a $GITHUB_ENV
+        echo "ROM_ZIP=$ZIP"       | tee -a $GITHUB_OUTPUT
+        echo "Found: $ZIP"
 
-    - name: Show ROM Size
+    - name: List size
       run: |
-        cd rom/out/target/product/${{ github.event.inputs.device_codename }}
-        ls -lh $ROM_ZIP
+        cd rom/out/target/product/${{ inputs.device_codename }}
+        ls -lh "$ZIP"
 
-    - name: Upload ROM Artifact
-      uses: actions/upload-artifact@v4
+    #─────────────────────────────────────────────────────────────────
+    #   8)  Uploads (artifact + release)
+    #─────────────────────────────────────────────────────────────────
+    - uses: actions/upload-artifact@v4
       with:
-        name: ${{ env.ROM_ZIP }}
-        path: rom/out/target/product/${{ github.event.inputs.device_codename }}/${{ env.ROM_ZIP }}
+        name: ${{ steps.zippy.outputs.ROM_ZIP }}
+        path: rom/out/target/product/${{ inputs.device_codename }}/${{ steps.zippy.outputs.ROM_ZIP }}
 
-    - name: Upload Build Log
-      uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v4
       with:
         name: build.log
         path: rom/build.log
@@ -104,8 +187,6 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: rom-${{ github.event.inputs.device_codename }}-${{ github.run_number }}
-        name: ROM Build - ${{ github.event.inputs.device_codename }}
-        files: rom/out/target/product/${{ github.event.inputs.device_codename }}/${{ env.ROM_ZIP }}
-        draft: false
-        prerelease: false
+        tag_name: rom-${{ inputs.device_codename }}-${{ github.run_number }}
+        name: ${{ inputs.rom_name }}-${{ inputs.device_codename }}-${{ github.run_number }}
+        files: rom/out/target/product/${{ inputs.device_codename }}/${{ steps.zippy.outputs.ROM_ZIP }}
