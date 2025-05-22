@@ -7,14 +7,21 @@ on:
         description: 'ROM Name (e.g., LineageOS)'
         required: true
         default: 'lineage'
-      rom_manifest:
-        description: 'Manifest URL'
+      BUILD_DIFFERENT_ROM:
+        description: "Command to initialize a different 'repo' project:"
+        required: false
+        default: "echo 'Build Starting!'"
+      REMOVALS:
+        description: "Folders to be removed before syncing:"
+        required: false
+      LOCAL_MANIFEST:
+        description: "Personal local manifest [repository or raw]:"
         required: true
-        default: 'https://github.com/LineageOS/android.git'
-      rom_branch:
-        description: 'Manifest branch'
-        required: true
-        default: 'lineage-20.0'
+        default: 'https://github.com/sounddrill31/local_manifests_oxygen'
+      LOCAL_MANIFEST_BRANCH:
+        description: "Personal local manifest's branch:"
+        required: false
+        default: 'lineage-21-qpr3'
       devices:
         description: 'Device codenames (comma separated)'
         required: true
