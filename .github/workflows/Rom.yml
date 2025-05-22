@@ -62,41 +62,40 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
 
     steps:
-    - name: Checkout
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup build server dependencies
+    - name: Install dependencies
       run: |
         sudo apt update -y
-        sudo apt install -y \
-          openjdk-11-jdk bc bison build-essential ccache curl flex g++-multilib \
-          gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
-          lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libssl-dev libxml2 \
-          libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+        sudo apt install -y openjdk-11-jdk bc bison build-essential ccache curl flex g++-multilib \
+          gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+          liblz4-tool libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
+          rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
 
-    - name: Set Git Identity
+    - name: Set git config
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
 
-    - name: Setup repo tool
+    - name: Install repo tool
       run: |
-        curl https://storage.googleapis.com/git-repo-downloads/repo > repo
-        chmod a+x repo
+        curl https://storage.googleapis.com/git-repo-downloads/repo -o repo
+        chmod +x repo
         sudo mv repo /usr/local/bin/repo
 
-    - name: Run build_different_rom command
+    - name: Run custom build init command
       run: |
         cd ${{ github.workspace }}
         eval "${{ github.event.inputs.build_different_rom }}"
 
-    - name: Initialize ROM repo
+    - name: Initialize ROM repo manifest
       run: |
         mkdir -p "$ROM_DIR"
         cd "$ROM_DIR"
         repo init -u "${{ github.event.inputs.rom_manifest }}" -b "${{ github.event.inputs.rom_branch }}" --depth=1
 
-    - name: Apply local manifest
+    - name: Apply local manifest (if any)
       if: ${{ github.event.inputs.local_manifest_url != '' }}
       run: |
         cd "$ROM_DIR"
@@ -107,20 +106,20 @@ jobs:
           git clone -b "${{ github.event.inputs.local_manifest_branch }}" "${{ github.event.inputs.local_manifest_url }}" .repo/local_manifests
         fi
 
-    - name: Sync sources
+    - name: Sync repo sources
       run: |
         cd "$ROM_DIR"
         repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j$(nproc || echo 4)
 
-    - name: Clone device trees
+    - name: Clone device trees (if any)
       if: ${{ github.event.inputs.device_tree_urls != '' }}
       run: |
         cd "$ROM_DIR"
         IFS=',' read -ra URLS <<< "${{ github.event.inputs.device_tree_urls }}"
         IFS=',' read -ra BRANCHES <<< "${{ github.event.inputs.device_tree_branches }}"
         IFS=',' read -ra PATHS <<< "${{ github.event.inputs.device_tree_paths }}"
-        CODENAMES="${{ github.event.inputs.device_codenames }}"
-        FIRST_CODENAME="${CODENAMES%%,*}"
+        IFS=',' read -ra CODENAMES <<< "${{ github.event.inputs.device_codenames }}"
+        FIRST_CODENAME="${CODENAMES[0]}"
         for i in "${!URLS[@]}"; do
           url="${URLS[$i]}"
           branch="${BRANCHES[$i]:-main}"
@@ -146,13 +145,15 @@ jobs:
         echo -e "\033[1;33mStarting build with mka bacon\033[0m"
         mka bacon -j${{ github.event.inputs.build_jobs }} | tee build.log
 
-    - name: Save ccache stats
+    - name: Show ccache stats
       run: ccache -s
 
-    - name: Get ROM zip
-      id: getzip
+    - name: Find built ROM zip
+      id: find_zip
       run: |
-        cd "$ROM_DIR/out/target/product/${{ github.event.inputs.device_codenames%%,* }}"
+        IFS=',' read -ra CODENAMES <<< "${{ github.event.inputs.device_codenames }}"
+        FIRST_CODENAME="${CODENAMES[0]}"
+        cd "$ROM_DIR/out/target/product/$FIRST_CODENAME"
         ZIP_FILE=$(ls *.zip 2>/dev/null | grep -vE 'ota|incremental' | head -n1 || true)
         if [[ -z "$ZIP_FILE" ]]; then
           echo "::error ::No ROM zip found!"
@@ -160,11 +161,11 @@ jobs:
         fi
         echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
 
-    - name: Upload ROM
+    - name: Upload ROM artifact
       uses: actions/upload-artifact@v4
       with:
         name: ROM-${{ github.run_number }}
-        path: ${{ env.ROM_DIR }}/out/target/product/${{ github.event.inputs.device_codenames%%,* }}/${{ steps.getzip.outputs.zip_file }}
+        path: ${{ env.ROM_DIR }}/out/target/product/${{ steps.find_zip.outputs.zip_file }}
 
     - name: Upload build log
       uses: actions/upload-artifact@v4
@@ -172,14 +173,15 @@ jobs:
         name: build.log
         path: ${{ env.ROM_DIR }}/build.log
 
-    - name: Create GitHub Release
+    - name: Create GitHub Release and upload ROM zip
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: rom-${{ github.event.inputs.device_codenames%%,* }}-${{ github.run_number }}
-        name: ${{ github.event.inputs.rom_name }}-${{ github.event.inputs.device_codenames%%,* }}-${{ github.run_number }}
-        files: ${{ env.ROM_DIR }}/out/target/product/${{ github.event.inputs.device_codenames%%,* }}/${{ steps.getzip.outputs.zip_file }}
+        tag_name: rom-${{ github.run_number }}
+        name: ${{ github.event.inputs.rom_name }}-build-${{ github.run_number }}
+        files: ${{ env.ROM_DIR }}/out/target/product/${{ steps.find_zip.outputs.zip_file }}
 
-    - name: Clean up
+    - name: Cleanup workspace
       run: |
         echo -e "\033[1;36mBuild completed. Cleaning workspace.\033[0m"
         sudo rm -rf "$ROM_DIR"
+        
