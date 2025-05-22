@@ -1,0 +1,159 @@
+name: fuking rom builder 
+on:
+  workflow_dispatch:
+    inputs:
+      rom_name:
+        description: 'ROM Name (e.g., LineageOS)'
+        required: true
+        default: 'lineage'
+      rom_manifest:
+        description: 'Repo manifest URL'
+        required: true
+        default: 'https://github.com/LineageOS/android.git'
+      rom_branch:
+        description: 'Manifest branch'
+        required: true
+        default: 'lineage-20.0'
+      devices:
+        description: 'Device codenames (comma separated)'
+        required: true
+        default: 'davinci'
+      clean_build:
+        description: 'Full clean build?'
+        required: false
+        default: 'false'
+        type: boolean
+      ccache_size:
+        description: 'CCache size (e.g., 50G)'
+        required: false
+        default: '50G'
+      notify_telegram:
+        description: 'Send Telegram notifications?'
+        required: false
+        default: 'true'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ inputs.rom_name }}
+    runs-on: [self-hosted, linux, x86_64, rom-builder]
+    timeout-minutes: 6000 # 100 hours max
+
+    env:
+      ROM_DIR: /mnt/ssd/rom
+      CCACHE_DIR: /mnt/ssd/ccache
+      USE_CCACHE: 1
+      CCACHE_COMPRESS: 1
+      TZ: UTC
+
+    steps:
+    # ========== SETUP ==========
+    - name: Validate runner
+      run: |
+        MIN_DISK=500
+        MIN_RAM=64
+        AVAIL_DISK=$(df -BG --output=avail . | tail -1 | tr -d 'G')
+        TOTAL_RAM=$(free -g | awk '/Mem:/ {print $2}')
+        
+        [ "$AVAIL_DISK" -ge "$MIN_DISK" ] || {
+          echo "::error::Need ${MIN_DISK}G disk, found ${AVAIL_DISK}G";
+          exit 1;
+        }
+        [ "$TOTAL_RAM" -ge "$MIN_RAM" ] || {
+          echo "::error::Need ${MIN_RAM}G RAM, found ${TOTAL_RAM}G";
+          exit 1;
+        }
+        echo "✓ Runner Validated (${TOTAL_RAM}G RAM, ${AVAIL_DISK}G disk)"
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+          lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev \
+          libxml2 libxml2-utils lzop maven pngcrush rsync schedtool \
+          squashfs-tools xsltproc zip zlib1g-dev repo jq android-sdk-libsparse-utils \
+          xmlstarlet
+
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+        git config --global user.name "ROM Builder"
+        git config --global user.email "builder@localhost"
+        git lfs install
+
+    - name: Initialize workspace
+      run: |
+        mkdir -p "$ROM_DIR" "$CCACHE_DIR"
+        chmod -R 777 "$ROM_DIR" "$CCACHE_DIR"
+        ccache -M "${{ inputs.ccache_size }}"
+        ccache -o compression=true
+        ccache -z
+
+    # ========== SYNC SOURCES ==========
+    - name: Initialize repo
+      working-directory: ${{ env.ROM_DIR }}
+      run: |
+        repo init -u "${{ inputs.rom_manifest }}" \
+          -b "${{ inputs.rom_branch }}" \
+          --depth=1 \
+          --repo-rev=main
+
+    - name: Sync sources
+      working-directory: ${{ env.ROM_DIR }}
+      timeout-minutes: 120
+      run: |
+        repo sync -c -j$(nproc) \
+          --force-sync \
+          --no-clone-bundle \
+          --no-tags \
+          --optimized-fetch
+
+    # ========== BUILD ==========
+    - name: Clean if requested
+      if: ${{ inputs.clean_build == 'true' }}
+      working-directory: ${{ env.ROM_DIR }}
+      run: |
+        make clean
+        ccache -C
+
+    - name: Build ROMs
+      working-directory: ${{ env.ROM_DIR }}
+      id: build
+      run: |
+        source build/envsetup.sh
+        BUILD_STATUS="success"
+        DEVICE_LIST=(${INPUT_DEVICES//,/ })
+        
+        for device in "${DEVICE_LIST[@]}"; do
+          echo "::group::Building for $device"
+          {
+            lunch "${{ inputs.rom_name }}_${device}-userdebug"
+            mka bacon -j$(($(nproc) * 2)) 2>&1 | tee "build_${device}.log"
+            
+            if [ ! -f "out/target/product/${device}"/*.zip ]; then
+              echo "::error::Build failed for $device"
+              BUILD_STATUS="failed"
+            else
+              ZIP_FILE=$(ls out/target/product/${device}/*.zip | head -1)
+              echo "device_${device}_zip=${ZIP_FILE}" >> $GITHUB_OUTPUT
+              echo "device_${device}_size=$(du -h "${ZIP_FILE}" | cut -f1)" >> $GITHUB_OUTPUT
+            fi
+          } || {
+            echo "::error::Build crashed for $device"
+            BUILD_STATUS="failed"
+          }
+          echo "::endgroup::"
+        done
+        
+        echo "build_status=${BUILD_STATUS}" >> $GITHUB_OUTPUT
+        [ "$BUILD_STATUS" = "success" ] || exit 1
+
+    # ========== RELEASE ==========
+    - name: Create GitHub Release
+      if: steps.build.outputs.build_status == 'success'
+      id: release
+     
