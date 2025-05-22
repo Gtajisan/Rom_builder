@@ -1,26 +1,61 @@
-name: Testing ROM Builder 
+name: 🔥 testing rom builder 🫠
 
 on:
   workflow_dispatch:
     inputs:
+      # Core Build Options
       rom_name:
-        description: 'ROM Name (e.g., LineageOS, crDroid)'
+        description: 'ROM Name (e.g., lineage, crdroid)'
         required: true
         default: 'lineage'
       rom_manifest:
-        description: 'Manifest URL (e.g., https://github.com/LineageOS/android.git)'
+        description: 'Main manifest URL'
         required: true
         default: 'https://github.com/LineageOS/android.git'
       rom_branch:
         description: 'Manifest branch'
         required: true
         default: 'lineage-20.0'
+      
+      # Device Configuration
       devices:
         description: 'Device codenames (comma separated)'
         required: true
         default: 'davinci'
+      device_trees:
+        description: 'Device tree URLs (comma separated)'
+        required: false
+      device_branches:
+        description: 'Device tree branches (default=rom_branch)'
+        required: false
+      kernel_trees:
+        description: 'Kernel tree URLs (comma separated)'
+        required: false
+      vendor_trees:
+        description: 'Vendor tree URLs (comma separated)'
+        required: false
+      
+      # Build Customization
+      lunch_command:
+        description: 'Custom lunch command (leave empty for default)'
+        required: false
+        default: ''
+      build_command:
+        description: 'Custom build command (default=mka bacon)'
+        required: false
+        default: 'mka bacon'
+      extra_packages:
+        description: 'Additional packages to build (comma separated)'
+        required: false
+      
+      # System Configuration
       clean_build:
         description: 'Perform clean build?'
+        required: false
+        default: false
+        type: boolean
+      resync_sources:
+        description: 'Force resync all sources?'
         required: false
         default: false
         type: boolean
@@ -28,24 +63,14 @@ on:
         description: 'CCache size'
         required: false
         default: '50G'
-      repo_sync_jobs:
-        description: 'Repo sync threads'
+      
+      # Advanced Options
+      local_manifests:
+        description: 'Additional manifest URLs (comma separated)'
         required: false
-        default: '8'
-      build_jobs:
-        description: 'make -j value (0 for auto)'
+      custom_patches:
+        description: 'Patch script URL to apply'
         required: false
-        default: '0'
-      upload_sourceforge:
-        description: 'Upload to SourceForge?'
-        required: false
-        default: false
-        type: boolean
-      telegram_notify:
-        description: 'Send Telegram notifications?'
-        required: false
-        default: true
-        type: boolean
 
 env:
   ROM_DIR: /mnt/ssd/rom
@@ -56,63 +81,26 @@ env:
   BUILD_DATE: $(date +%Y%m%d)
 
 jobs:
-  validate:
-    name: 🔍 Validate Environment
-    runs-on: [self-hosted, linux, x86_64, rom-builder]
-    steps:
-      - name: Check hardware
-        run: |
-          echo "⚙️ Hardware Validation:"
-          echo "----------------------"
-          
-          # Minimum requirements
-          MIN_DISK=300
-          MIN_RAM=32
-          REC_DISK=500
-          REC_RAM=64
-          
-          # Current specs
-          CPU_CORES=$(nproc)
-          TOTAL_RAM=$(free -g | awk '/Mem:/ {print $2}')
-          AVAIL_DISK=$(df -BG --output=avail . | tail -1 | tr -d 'G')
-          
-          echo "• CPU Cores: ${CPU_CORES}"
-          echo "• RAM: ${TOTAL_RAM}GB"
-          echo "• Disk Space: ${AVAIL_DISK}GB free"
-          
-          # Validation checks
-          if [ "$AVAIL_DISK" -lt "$MIN_DISK" ]; then
-            echo "::error::❌ Insufficient disk space! Minimum ${MIN_DISK}GB required, found ${AVAIL_DISK}GB"
-            exit 1
-          fi
-          
-          if [ "$TOTAL_RAM" -lt "$MIN_RAM" ]; then
-            echo "::error::❌ Insufficient RAM! Minimum ${MIN_RAM}GB required, found ${TOTAL_RAM}GB"
-            exit 1
-          fi
-          
-          if [ "$AVAIL_DISK" -lt "$REC_DISK" ]; then
-            echo "⚠️ Warning: For optimal performance, recommend ${REC_DISK}GB disk space"
-          fi
-          
-          if [ "$TOTAL_RAM" -lt "$REC_RAM" ]; then
-            echo "⚠️ Warning: For optimal performance, recommend ${REC_RAM}GB RAM"
-          fi
-          
-          echo "✅ Environment validated successfully"
-
   build:
     name: 🏗 Build ${{ inputs.rom_name }}
-    needs: validate
     runs-on: [self-hosted, linux, x86_64, rom-builder]
     timeout-minutes: 6000
     
     steps:
-      # ========== SETUP ==========
-      - name: 📦 Install dependencies
+      # ================= SETUP =================
+      - name: 🔍 Validate Environment
         run: |
-          echo "Installing build dependencies..."
-          sudo apt update -y
+          echo "⚙️ Hardware Validation:"
+          [ $(df -BG --output=avail . | tail -1 | tr -d 'G') -gt 300 ] || {
+            echo "::error::Need 300GB+ disk"; exit 1;
+          }
+          [ $(free -g | awk '/Mem:/ {print $2}') -gt 32 ] || {
+            echo "::error::Need 32GB+ RAM"; exit 1;
+          }
+
+      - name: 📦 Install Dependencies
+        run: |
+          sudo apt update
           sudo DEBIAN_FRONTEND=noninteractive apt install -y \
             bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
             git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
@@ -120,63 +108,96 @@ jobs:
             libxml2 libxml2-utils lzop maven pngcrush rsync schedtool \
             squashfs-tools xsltproc zip zlib1g-dev repo jq android-sdk-libsparse-utils \
             xmlstarlet pigz p7zip-full aria2 patchelf
-          
-          # Python compatibility
+
           sudo ln -sf /usr/bin/python3 /usr/bin/python
-          
-          # Git configuration
           git config --global user.name "ROM Builder"
           git config --global user.email "builder@localhost"
-          git config --global color.ui auto
           git lfs install
-          echo "Dependencies installed successfully"
 
-      - name: 🗂 Initialize workspace
+      - name: 🗂 Initialize Workspace
         run: |
           mkdir -p "$ROM_DIR" "$CCACHE_DIR"
           chmod -R 777 "$ROM_DIR" "$CCACHE_DIR"
-          
-          # CCache configuration
           ccache -M "${{ inputs.ccache_size }}"
           ccache -o compression=true
           ccache -z
-          echo "Workspace initialized | CCache: ${{ inputs.ccache_size }}"
 
-      # ========== SYNC ==========
-      - name: ⚡ Initialize repo
+      # ================= SYNC =================
+      - name: ⚡ Initialize Repo
         working-directory: ${{ env.ROM_DIR }}
         run: |
-          echo "Initializing repo manifest..."
           repo init -u "${{ inputs.rom_manifest }}" \
             -b "${{ inputs.rom_branch }}" \
             --depth=1 \
-            --repo-rev=main \
-            --platform=auto
-          echo "Repo initialized successfully"
+            --repo-rev=main
 
-      - name: 🔄 Sync sources
-        working-directory: ${{ env.ROM_DIR }}
-        timeout-minutes: 120
-        run: |
-          echo "Syncing sources with ${{ inputs.repo_sync_jobs }} threads..."
-          repo sync -c -j${{ inputs.repo_sync_jobs }} \
-            --force-sync \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            --fail-fast
-          echo "Source sync completed"
-
-      # ========== BUILD ==========
-      - name: 🧹 Clean build (if requested)
-        if: ${{ inputs.clean_build == 'true' }}
+      - name: 📜 Apply Local Manifests
+        if: ${{ inputs.local_manifests }}
         working-directory: ${{ env.ROM_DIR }}
         run: |
-          echo "Performing clean build..."
+          mkdir -p .repo/local_manifests
+          IFS=',' read -ra MANIFESTS <<< "${{ inputs.local_manifests }}"
+          for url in "${MANIFESTS[@]}"; do
+            if [[ "$url" == *.xml ]]; then
+              curl -L -o ".repo/local_manifests/$(basename "$url")" "$url"
+            else
+              git clone --depth=1 "$url" .repo/local_manifests/$(basename "$url" .git)
+            fi
+          done
+
+      - name: 🔄 Sync Sources
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
+          if ${{ inputs.resync_sources }}; then
+            repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
+          else
+            repo sync -c -j$(nproc) --no-clone-bundle --no-tags --optimized-fetch
+          fi
+
+      # ================= DEVICE SETUP =================
+      - name: 🌳 Clone Device Trees
+        if: ${{ inputs.device_trees }}
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
+          IFS=',' read -ra TREES <<< "${{ inputs.device_trees }}"
+          IFS=',' read -ra BRANCHES <<< "${{ inputs.device_branches || inputs.rom_branch }}"
+          for i in "${!TREES[@]}"; do
+            git clone --depth=1 -b "${BRANCHES[$i]}" "${TREES[$i]}" "device/${TREES[$i]##*/}"
+          done
+
+      - name: 💾 Clone Kernel Trees
+        if: ${{ inputs.kernel_trees }}
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
+          IFS=',' read -ra KERNELS <<< "${{ inputs.kernel_trees }}"
+          for kernel in "${KERNELS[@]}"; do
+            git clone --depth=1 -b "${{ inputs.rom_branch }}" "$kernel" "kernel/${kernel##*/}"
+          done
+
+      - name: 🏭 Clone Vendor Trees
+        if: ${{ inputs.vendor_trees }}
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
+          IFS=',' read -ra VENDORS <<< "${{ inputs.vendor_trees }}"
+          for vendor in "${VENDORS[@]}"; do
+            git clone --depth=1 -b "${{ inputs.rom_branch }}" "$vendor" "vendor/${vendor##*/}"
+          done
+
+      - name: 🩹 Apply Custom Patches
+        if: ${{ inputs.custom_patches }}
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
+          curl -L "${{ inputs.custom_patches }}" > patches.sh
+          bash patches.sh
+
+      # ================= BUILD =================
+      - name: 🧹 Clean Workspace
+        if: ${{ inputs.clean_build }}
+        working-directory: ${{ env.ROM_DIR }}
+        run: |
           make clean
           ccache -C
           rm -rf out
-          echo "Clean build completed"
 
       - name: 🔨 Build ROMs
         working-directory: ${{ env.ROM_DIR }}
@@ -184,35 +205,73 @@ jobs:
         run: |
           source build/envsetup.sh
           BUILD_STATUS="success"
-          DEVICE_LIST=(${INPUT_DEVICES//,/ })
-          BUILD_JOBS=$([ "${{ inputs.build_jobs }}" = "0" ] && echo "$(($(nproc) * 2))" || echo "${{ inputs.build_jobs }}")
+          IFS=',' read -ra DEVICES <<< "${{ inputs.devices }}"
           
-          echo "📊 Build Parameters:"
-          echo "• ROM: ${{ inputs.rom_name }}"
-          echo "• Branch: ${{ inputs.rom_branch }}"
-          echo "• Devices: ${DEVICE_LIST[*]}"
-          echo "• Build Jobs: ${BUILD_JOBS}"
-          echo "• CCache: ${{ inputs.ccache_size }}"
-          
-          for device in "${DEVICE_LIST[@]}"; do
+          for device in "${DEVICES[@]}"; do
             echo "::group::📱 Building $device"
-            START_TIME=$(date +%s)
             
-            # Lunch and build
-            if ! lunch "${{ inputs.rom_name }}_${device}-userdebug"; then
-              echo "::error::❌ Lunch failed for $device"
-              BUILD_STATUS="failed"
-              echo "::endgroup::"
-              continue
+            # Custom or default lunch
+            if [ -n "${{ inputs.lunch_command }}" ]; then
+              eval "${{ inputs.lunch_command }}"
+            else
+              lunch "${{ inputs.rom_name }}_${device}-userdebug"
             fi
             
-            if ! mka bacon -j${BUILD_JOBS} 2>&1 | tee "build_${device}.log"; then
+            # Execute build
+            if ! eval "${{ inputs.build_command }}"; then
               echo "::error::❌ Build failed for $device"
               BUILD_STATUS="failed"
               echo "::endgroup::"
               continue
             fi
             
-            # Process build results
-            END_TIME=$(date +%s)
-            DURATION=$((END
+            # Package additional targets
+            if [ -n "${{ inputs.extra_packages }}" ]; then
+              IFS=',' read -ra EXTRAS <<< "${{ inputs.extra_packages }}"
+              for extra in "${EXTRAS[@]}"; do
+                mka "$extra"
+              done
+            fi
+            
+            echo "::endgroup::"
+          done
+          
+          echo "build_status=${BUILD_STATUS}" >> $GITHUB_OUTPUT
+          [ "$BUILD_STATUS" = "success" ] || exit 1
+
+      # ================= ARTIFACTS =================
+      - name: 🚀 Create Release
+        if: steps.build.outputs.build_status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.rom_name }}-${{ env.BUILD_DATE }}
+          name: ${{ inputs.rom_name }} Build ${{ env.BUILD_DATE }}
+          body: |
+            ### Build Details
+            - **ROM**: ${{ inputs.rom_name }}
+            - **Branch**: ${{ inputs.rom_branch }}
+            - **Devices**: ${{ inputs.devices }}
+            
+            ### Build Command
+            ```bash
+            ${{ inputs.build_command }}
+            ```
+          files: ${{ env.ROM_DIR }}/out/target/product/*/*.zip
+          draft: false
+          prerelease: false
+
+      - name: 📦 Archive Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rom-artifacts
+          path: |
+            ${{ env.ROM_DIR }}/out/target/product/*/*.zip
+            ${{ env.ROM_DIR }}/build_*.log
+          retention-days: 7
+
+      # ================= CLEANUP =================
+      - name: 🧹 Final Cleanup
+        run: |
+          find "$ROM_DIR/out" -mindepth 1 -delete
+          echo "Final CCache Stats:"
+          ccache -s
